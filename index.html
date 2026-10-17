@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <meta name="theme-color" content="#05120d">
-<title>LUNA · Visor de la flecha detectora</title>
+<title>LUNA · Visor de la flecha detectora (Arrow / Long / Long 4 / Long 8)</title>
 <style>
   :root { --g:#3cff9e; --g2:#1c8f5a; --r:#ff4d4d; --y:#ffd24d; --bg:#05120d; }
   * { box-sizing:border-box; }
@@ -30,14 +30,15 @@
   <button id="btnDemo">Demo</button>
 </div>
 <div id="info">
-  <div class="legend"><span style="color:#3cff9e">● presencia</span><span style="color:#ff4d4d">● movimiento</span><span>▲ = dirección en la que volaba la flecha</span></div>
+  <div class="legend"><span style="color:#3cff9e">● presencia</span><span style="color:#ff4d4d">● movimiento</span><span style="color:#ffd24d">◔ movimiento lejano (K-LD2, sin distancia)</span><span>▲ = dirección en la que volaba la flecha</span></div>
   <div id="meta">Chrome en Android · Bluetooth y ubicación activados · página servida por https o localhost</div>
 </div>
 <script>
 'use strict';
 const SVC = '6e4c0001-7a1b-4c8e-9f00-4c554e410001';
 const TGT = '6e4c0002-7a1b-4c8e-9f00-4c554e410001';
-const RANGE_MM = 6000;
+let RANGE_MM = 6000;          // se adapta solo: 6 m (LD2450), 15 m (K-LD2), 40 m (anillo LD2451)
+let longDet = null;           // detección del K-LD2 (Luna Long): sector + velocidad
 const PHASES = {0:'—',1:'ESCANEO 1 · presencia',2:'ESCANEO 2 · movimiento',3:'REVELADO',4:'fin'};
 
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
@@ -56,8 +57,19 @@ function parse(dv){
   state.phase = phase; state.batt = batt; state.facingDown = !!(flags & 0x80);
   state.remain = dv.getUint16(16, true) * 10; state.lastPkt = performance.now();
   if (idx === 0xFF) return;
+  if (idx === 3) {            // Luna Long: K-LD2 (Doppler). [4..5] cm/s [6] dB [8..11] dirección del haz en el suelo
+    if (RANGE_MM < 15000) RANGE_MM = 15000;
+    if (!(flags & 1)) { if (phase !== 3) longDet = null; return; }
+    longDet = { v: g(4), db: dv.getUint8(6), bx: -g(10), by: g(8), approaching: !!(flags & 4), t: performance.now() };
+    if (navigator.vibrate && phase === 3) navigator.vibrate(30);
+    return;
+  }
+  const cm = !!(flags & 8);   // anillo LD2451: coordenadas en cm
+  if (cm && RANGE_MM < 40000) RANGE_MM = 40000;
   if (!(flags & 1)) { if (phase !== 3) blips.delete(idx); return; }
-  const rx = g(4), ry = g(6), v = g(8), fwd = g(10), left = g(12), up = g(14);
+  const k = cm ? 10 : 1;
+  let rx = g(4), ry = g(6), v = g(8), fwd = g(10)*k, left = g(12)*k, up = g(14)*k;
+  if (cm) { const ang = ((rx >> 8) & 0xFF) - 128, d = ry * 10; rx = d * Math.sin(ang*Math.PI/180); ry = d * Math.cos(ang*Math.PI/180); }
   // Pantalla: arriba = adelante (dirección de vuelo). Izquierda de pantalla = izquierda real.
   const px = groundFrame ? -left : rx;
   const py = groundFrame ? fwd : ry;
@@ -100,7 +112,8 @@ function draw(now){
   ctx.fillStyle = '#05120d'; ctx.fillRect(0,0,W,H);
   // anillos cada metro
   ctx.strokeStyle = '#1c8f5a'; ctx.lineWidth = 2; ctx.fillStyle = '#1c8f5a'; ctx.font = '22px monospace';
-  for (let m = 1; m <= 6; m++) { ctx.beginPath(); ctx.arc(cx, cy, R*m/6, 0, Math.PI*2); ctx.stroke(); ctx.fillText(m+' m', cx + 6, cy - R*m/6 + 24); }
+  const stepM = RANGE_MM > 20000 ? 10 : RANGE_MM > 8000 ? 3 : 1, nR = Math.round(RANGE_MM/1000/stepM);
+  for (let i = 1; i <= nR; i++) { const rr = R*i/nR; ctx.beginPath(); ctx.arc(cx, cy, rr, 0, Math.PI*2); ctx.stroke(); ctx.fillText(i*stepM+' m', cx + 6, cy - rr + 24); }
   ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy); ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
   // haz giratorio (más rápido en el escaneo 2)
   const active = state.phase === 1 || state.phase === 2;
@@ -126,6 +139,19 @@ function draw(now){
     const d = Math.hypot(b.x, b.y)/1000;
     ctx.fillText(d.toFixed(1)+' m' + (b.moving ? ' · '+Math.abs(b.v)+' cm/s' : ''), sx + 18, sy - 14);
   }
+  // K-LD2: sector de movimiento lejano (de 6 m al borde), en la dirección del haz
+  if (longDet) {
+    const age = now - longDet.t;
+    if (age > 9000) longDet = null;
+    else {
+      const a = Math.max(0, 1 - age/9000), ang = Math.atan2(-longDet.by, longDet.bx), r0 = R*6000/RANGE_MM;
+      ctx.fillStyle = `rgba(255,210,77,${0.18 + 0.25*a*(0.5+0.5*Math.sin(now/150))})`;
+      ctx.beginPath(); ctx.arc(cx, cy, R, ang-0.7, ang+0.7); ctx.arc(cx, cy, r0, ang+0.7, ang-0.7, true); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = `rgba(255,255,255,${a})`; ctx.font = '22px monospace';
+      const tx = cx + Math.cos(ang)*R*0.72, ty = cy + Math.sin(ang)*R*0.72;
+      ctx.fillText((longDet.approaching ? 'SE ACERCA ' : 'se aleja ') + (Math.abs(longDet.v)*0.036).toFixed(1) + ' km/h · ' + longDet.db + ' dB', Math.min(tx - 120, W - 380), ty);
+    }
+  }
   // HUD
   ctx.fillStyle = '#3cff9e'; ctx.font = '24px monospace';
   ctx.fillText(PHASES[state.phase] || '', 16, 34);
@@ -147,13 +173,14 @@ function demo(){
       blips.set(0, { x: 1500, y: 3000, v: 0, moving:false, t: performance.now() });
       blips.set(1, { x: -2500 + t*200, y: 2000 + t*100, v: 45, moving: state.phase===2, t: performance.now() });
     }
+    if (location.search.includes('long')) { RANGE_MM = 15000; if (state.phase >= 2) longDet = { v: 140, db: 38, bx: 0.3, by: 1, approaching: true, t: performance.now() }; }
     if (t > 12) { clearInterval(demoTimer); demoTimer = null; }
   }, 200);
 }
 
 document.getElementById('btnConnect').onclick = connect;
 document.getElementById('btnDemo').onclick = demo;
-document.getElementById('btnFrame').onclick = e => { groundFrame = !groundFrame; e.target.textContent = 'Vista: ' + (groundFrame ? 'suelo' : 'radar'); blips.clear(); };
+document.getElementById('btnFrame').onclick = e => { longDet = null; groundFrame = !groundFrame; e.target.textContent = 'Vista: ' + (groundFrame ? 'suelo' : 'radar'); blips.clear(); };
 if (location.search.includes('demo')) demo();
 if (!navigator.bluetooth) $meta.innerHTML = '<span class="warn">Web Bluetooth no disponible aquí. Usa Chrome en Android y abre la página por https (p. ej. GitHub Pages) o localhost.</span>';
 </script>
