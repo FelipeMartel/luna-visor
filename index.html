@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="theme-color" content="#05120d">
+<title>LUNA · Visor de la flecha detectora</title>
+<style>
+  :root { --g:#3cff9e; --g2:#1c8f5a; --r:#ff4d4d; --y:#ffd24d; --bg:#05120d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--g); font:14px/1.35 ui-monospace,Menlo,Consolas,monospace; display:flex; flex-direction:column; align-items:center; min-height:100vh; }
+  header { width:100%; padding:10px 14px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--g2); }
+  h1 { font-size:16px; margin:0; letter-spacing:2px; }
+  #status { font-size:12px; opacity:.85; }
+  canvas { width:min(96vw,96vh - 220px); height:auto; aspect-ratio:1; margin:10px 0; touch-action:none; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; justify-content:center; padding:0 10px; }
+  button { background:transparent; color:var(--g); border:1px solid var(--g); padding:10px 14px; border-radius:6px; font:inherit; }
+  button:active { background:var(--g2); }
+  #info { font-size:12px; padding:6px 12px; text-align:center; max-width:640px; opacity:.9; }
+  .warn { color:var(--y); }
+  .legend span { margin:0 6px; }
+</style>
+</head>
+<body>
+<header><h1>◉ LUNA · DETECCIÓN</h1><div id="status">desconectado</div></header>
+<canvas id="c" width="900" height="900"></canvas>
+<div class="row">
+  <button id="btnConnect">Conectar flecha</button>
+  <button id="btnFrame">Vista: suelo</button>
+  <button id="btnDemo">Demo</button>
+</div>
+<div id="info">
+  <div class="legend"><span style="color:#3cff9e">● presencia</span><span style="color:#ff4d4d">● movimiento</span><span>▲ = dirección en la que volaba la flecha</span></div>
+  <div id="meta">Chrome en Android · Bluetooth y ubicación activados · página servida por https o localhost</div>
+</div>
+<script>
+'use strict';
+const SVC = '6e4c0001-7a1b-4c8e-9f00-4c554e410001';
+const TGT = '6e4c0002-7a1b-4c8e-9f00-4c554e410001';
+const RANGE_MM = 6000;
+const PHASES = {0:'—',1:'ESCANEO 1 · presencia',2:'ESCANEO 2 · movimiento',3:'REVELADO',4:'fin'};
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const $status = document.getElementById('status'), $meta = document.getElementById('meta');
+let device = null, groundFrame = true, demoTimer = null;
+let state = { phase:0, batt:null, facingDown:false, remain:0, lastPkt:0 };
+// blips: {key, x, y, moving, t}
+let blips = new Map();
+
+function setStatus(s){ $status.textContent = s; }
+
+function parse(dv){
+  if (dv.byteLength < 18) return;
+  const phase = dv.getUint8(0), idx = dv.getUint8(1), flags = dv.getUint8(2), batt = dv.getUint8(3);
+  const g = o => dv.getInt16(o, true);
+  state.phase = phase; state.batt = batt; state.facingDown = !!(flags & 0x80);
+  state.remain = dv.getUint16(16, true) * 10; state.lastPkt = performance.now();
+  if (idx === 0xFF) return;
+  if (!(flags & 1)) { if (phase !== 3) blips.delete(idx); return; }
+  const rx = g(4), ry = g(6), v = g(8), fwd = g(10), left = g(12), up = g(14);
+  // Pantalla: arriba = adelante (dirección de vuelo). Izquierda de pantalla = izquierda real.
+  const px = groundFrame ? -left : rx;
+  const py = groundFrame ? fwd : ry;
+  blips.set(idx, { x:px, y:py, v, moving: !!(flags & 2), t: performance.now(), phase, up });
+  if (navigator.vibrate && phase === 3) navigator.vibrate(30);
+}
+
+async function connect(){
+  if (!navigator.bluetooth) { alert('Este navegador no soporta Web Bluetooth. Usa Chrome en Android (https o localhost).'); return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters:[{ services:[SVC] }, { namePrefix:'LUNA' }], optionalServices:[SVC] });
+    device.addEventListener('gattserverdisconnected', () => { setStatus('esperando a la flecha… (dormida)'); reconnectLoop(); });
+    await attach();
+  } catch(e) { setStatus('error: ' + e.message); }
+}
+async function attach(){
+  setStatus('conectando…');
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SVC);
+  const ch = await svc.getCharacteristic(TGT);
+  ch.addEventListener('characteristicvaluechanged', ev => parse(ev.target.value));
+  await ch.startNotifications();
+  setStatus('conectado · ' + (device.name || 'LUNA'));
+}
+// La flecha duerme entre disparos: reintentamos hasta que vuelva a anunciarse tras un impacto
+let reconnecting = false;
+async function reconnectLoop(){
+  if (reconnecting || !device) return; reconnecting = true;
+  while (device && !device.gatt.connected) {
+    try { await attach(); break; } catch(e) { await new Promise(r => setTimeout(r, 1200)); }
+  }
+  reconnecting = false;
+}
+
+// ---------------- dibujo ----------------
+let sweep = 0, lastT = performance.now();
+function draw(now){
+  const dt = (now - lastT) / 1000; lastT = now;
+  const W = cv.width, H = cv.height, cx = W/2, cy = H/2, R = W*0.46;
+  ctx.fillStyle = '#05120d'; ctx.fillRect(0,0,W,H);
+  // anillos cada metro
+  ctx.strokeStyle = '#1c8f5a'; ctx.lineWidth = 2; ctx.fillStyle = '#1c8f5a'; ctx.font = '22px monospace';
+  for (let m = 1; m <= 6; m++) { ctx.beginPath(); ctx.arc(cx, cy, R*m/6, 0, Math.PI*2); ctx.stroke(); ctx.fillText(m+' m', cx + 6, cy - R*m/6 + 24); }
+  ctx.beginPath(); ctx.moveTo(cx-R,cy); ctx.lineTo(cx+R,cy); ctx.moveTo(cx,cy-R); ctx.lineTo(cx,cy+R); ctx.stroke();
+  // haz giratorio (más rápido en el escaneo 2)
+  const active = state.phase === 1 || state.phase === 2;
+  sweep += dt * (state.phase === 2 ? 5 : 2.2);
+  if (active || demoTimer) {
+    const grd = ctx.createRadialGradient(cx,cy,0,cx,cy,R);
+    grd.addColorStop(0,'rgba(60,255,158,.35)'); grd.addColorStop(1,'rgba(60,255,158,0)');
+    ctx.fillStyle = grd; ctx.beginPath(); ctx.moveTo(cx,cy); ctx.arc(cx,cy,R,sweep-0.5,sweep); ctx.closePath(); ctx.fill();
+  }
+  // flecha en el centro (▲ = dirección de vuelo)
+  ctx.fillStyle = '#3cff9e'; ctx.beginPath(); ctx.moveTo(cx, cy-18); ctx.lineTo(cx-10, cy+12); ctx.lineTo(cx+10, cy+12); ctx.closePath(); ctx.fill();
+  // blancos (revelado temporal: se desvanecen)
+  const life = 9000;
+  for (const [k,b] of blips) {
+    const age = now - b.t; if (age > life) { blips.delete(k); continue; }
+    const a = Math.max(0, 1 - age/life);
+    const sx = cx + b.x / RANGE_MM * R, sy = cy - b.y / RANGE_MM * R;
+    const col = b.moving ? '255,77,77' : '60,255,158';
+    const pulse = 14 + 8*Math.sin(now/120);
+    ctx.fillStyle = `rgba(${col},${a})`; ctx.beginPath(); ctx.arc(sx, sy, 12, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = `rgba(${col},${a*0.7})`; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(sx, sy, pulse+8, 0, Math.PI*2); ctx.stroke();
+    ctx.fillStyle = `rgba(255,255,255,${a})`; ctx.font = '20px monospace';
+    const d = Math.hypot(b.x, b.y)/1000;
+    ctx.fillText(d.toFixed(1)+' m' + (b.moving ? ' · '+Math.abs(b.v)+' cm/s' : ''), sx + 18, sy - 14);
+  }
+  // HUD
+  ctx.fillStyle = '#3cff9e'; ctx.font = '24px monospace';
+  ctx.fillText(PHASES[state.phase] || '', 16, 34);
+  if (state.batt !== null) ctx.fillText('BAT ' + state.batt + '%', W - 150, 34);
+  if (state.remain && (now - state.lastPkt) < 1500) ctx.fillText((state.remain/1000).toFixed(1) + ' s', W - 120, H - 20);
+  if (state.facingDown) { ctx.fillStyle = '#ffd24d'; ctx.fillText('⚠ radar mirando al suelo', 16, H - 20); }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+// ---------------- demo sin hardware ----------------
+function demo(){
+  if (demoTimer) { clearInterval(demoTimer); demoTimer = null; blips.clear(); state.phase = 0; return; }
+  let t = 0; state.batt = 87;
+  demoTimer = setInterval(() => {
+    t += 0.2; state.lastPkt = performance.now();
+    state.phase = t < 2.5 ? 1 : t < 5 ? 2 : t < 11 ? 3 : 4; state.remain = 1000;
+    if (state.phase <= 2) {
+      blips.set(0, { x: 1500, y: 3000, v: 0, moving:false, t: performance.now() });
+      blips.set(1, { x: -2500 + t*200, y: 2000 + t*100, v: 45, moving: state.phase===2, t: performance.now() });
+    }
+    if (t > 12) { clearInterval(demoTimer); demoTimer = null; }
+  }, 200);
+}
+
+document.getElementById('btnConnect').onclick = connect;
+document.getElementById('btnDemo').onclick = demo;
+document.getElementById('btnFrame').onclick = e => { groundFrame = !groundFrame; e.target.textContent = 'Vista: ' + (groundFrame ? 'suelo' : 'radar'); blips.clear(); };
+if (location.search.includes('demo')) demo();
+if (!navigator.bluetooth) $meta.innerHTML = '<span class="warn">Web Bluetooth no disponible aquí. Usa Chrome en Android y abre la página por https (p. ej. GitHub Pages) o localhost.</span>';
+</script>
+</body>
+</html>
